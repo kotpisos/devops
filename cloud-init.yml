@@ -1,0 +1,46 @@
+#cloud-config
+
+# Hetzner Cloud developer VM provisioning
+# Usage: pass this file as "User data" when creating a Hetzner Cloud server
+# Image: Debian 12 (Bookworm)
+
+users:
+  - name: developer
+    groups: sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys: []  # Add your SSH public key(s) here
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - git
+  - make
+  - jq
+  - htop
+  - tmux
+
+runcmd:
+  # ─── Install Docker (official docs method for Debian) ───────────────────────
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  # ─── Post-install: add user to docker group ─────────────────────────────────
+  - usermod -aG docker developer
+
+  # ─── Clone repos ────────────────────────────────────────────────────────────
+  - su - developer -c "mkdir -p ~/projects"
+  - su - developer -c "git clone https://github.com/reconnect-stack/gateway.git ~/projects/gateway"
+
+  # ─── Done ───────────────────────────────────────────────────────────────────
+  - echo "Cloud-init provisioning complete" > /home/developer/PROVISIONED
+
+final_message: "VM ready. Provisioning took $UPTIME seconds."

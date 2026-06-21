@@ -1,0 +1,266 @@
+networks:
+  chatwoot-net:
+    driver: bridge
+  gateway-net:
+    driver: bridge
+  shared:
+    driver: bridge
+
+services:
+  # ─── Chatwoot ───────────────────────────────────────────────────────────────
+  cw-rails:
+    extends:
+      file: ../chatwoot/docker-compose.dev.yml
+      service: base
+    depends_on:
+      - cw-postgres
+      - cw-redis
+    ports:
+      - "0.0.0.0:${CW_PORT}:3000"
+    environment:
+      - NODE_ENV=production
+      - RAILS_ENV=production
+      - INSTALLATION_ENV=docker
+      - SECRET_KEY_BASE=${CW_SECRET_KEY_BASE:?CW_SECRET_KEY_BASE is required}
+      - FRONTEND_URL=${CW_FRONTEND_URL:?CW_FRONTEND_URL is required}
+      - POSTGRES_HOST=cw-postgres
+      - POSTGRES_USERNAME=${CW_POSTGRES_USER:?CW_POSTGRES_USER is required}
+      - POSTGRES_PASSWORD=${CW_POSTGRES_PASSWORD:?CW_POSTGRES_PASSWORD is required}
+      - POSTGRES_DATABASE=${CW_POSTGRES_DB:?CW_POSTGRES_DB is required}
+      - REDIS_URL=redis://:${CW_REDIS_PASSWORD:?CW_REDIS_PASSWORD is required}@cw-redis:6379
+      - REDIS_PASSWORD=${CW_REDIS_PASSWORD}
+      - RAILS_LOG_TO_STDOUT=true
+      - MAILER_SENDER_EMAIL=${CW_MAILER_SENDER_EMAIL}
+      - SMTP_ADDRESS=${CW_SMTP_ADDRESS}
+      - SMTP_PORT=${CW_SMTP_PORT}
+      - SMTP_USERNAME=${CW_SMTP_USERNAME}
+      - SMTP_PASSWORD=${CW_SMTP_PASSWORD}
+      - CW_SEED_EMAIL=${CW_SEED_EMAIL:?CW_SEED_EMAIL is required}
+      - CW_SEED_PASSWORD=${CW_SEED_PASSWORD:?CW_SEED_PASSWORD is required}
+    entrypoint: docker/entrypoints/rails.sh
+    # db:chatwoot_prepare runs schema + migrations.
+    # db:chatwoot_prepare runs schema + migrations.
+    # On first boot: rails runner creates seed user and writes access token to shared volume.
+    # On subsequent boots: skips runner entirely (token file already on volume).
+    command:
+      - sh
+      - -c
+      - |
+        bundle exec rails db:chatwoot_prepare
+        if [ ! -f /shared/cw_access_token ]; then
+          bundle exec rails runner "
+            email = ENV['CW_SEED_EMAIL']
+            password = ENV['CW_SEED_PASSWORD']
+            unless User.find_by(email: email)
+              account = Account.create!(name: 'Acme Inc')
+              user = User.new(name: 'John', email: email, password: password, type: 'SuperAdmin')
+              user.skip_confirmation!
+              user.save!
+              AccountUser.create!(account_id: account.id, user_id: user.id, role: :administrator)
+              puts \"Seed user #{email} created.\"
+            end
+            token = User.find_by(email: email).access_token.token
+            File.write('/shared/cw_access_token', token)
+            Redis::Alfred.delete(Redis::Alfred::CHATWOOT_INSTALLATION_ONBOARDING)
+            puts \"Token: #{token}\"
+          "
+        else
+          echo "Token file exists, skipping user setup."
+        fi
+        exec bundle exec rails s -p 3000 -b 0.0.0.0
+    volumes:
+      - cw-storage:/app/storage
+      - gw-shared:/shared
+    networks:
+      - chatwoot-net
+      - shared
+
+  cw-sidekiq:
+    extends:
+      file: ../chatwoot/docker-compose.dev.yml
+      service: base
+    depends_on:
+      - cw-postgres
+      - cw-redis
+    environment:
+      - NODE_ENV=production
+      - RAILS_ENV=production
+      - INSTALLATION_ENV=docker
+      - SECRET_KEY_BASE=${CW_SECRET_KEY_BASE:?CW_SECRET_KEY_BASE is required}
+      - FRONTEND_URL=${CW_FRONTEND_URL:?CW_FRONTEND_URL is required}
+      - POSTGRES_HOST=cw-postgres
+      - POSTGRES_USERNAME=${CW_POSTGRES_USER:?CW_POSTGRES_USER is required}
+      - POSTGRES_PASSWORD=${CW_POSTGRES_PASSWORD:?CW_POSTGRES_PASSWORD is required}
+      - POSTGRES_DATABASE=${CW_POSTGRES_DB:?CW_POSTGRES_DB is required}
+      - REDIS_URL=redis://:${CW_REDIS_PASSWORD:?CW_REDIS_PASSWORD is required}@cw-redis:6379
+      - REDIS_PASSWORD=${CW_REDIS_PASSWORD}
+      - RAILS_LOG_TO_STDOUT=true
+      - MAILER_SENDER_EMAIL=${CW_MAILER_SENDER_EMAIL}
+      - SMTP_ADDRESS=${CW_SMTP_ADDRESS}
+      - SMTP_PORT=${CW_SMTP_PORT}
+      - SMTP_USERNAME=${CW_SMTP_USERNAME}
+      - SMTP_PASSWORD=${CW_SMTP_PASSWORD}
+    command: ["bundle", "exec", "sidekiq", "-C", "config/sidekiq.yml"]
+    volumes:
+      - cw-storage:/app/storage
+    networks:
+      - chatwoot-net
+      - shared
+
+  cw-postgres:
+    extends:
+      file: ../chatwoot/docker-compose.dev.yml
+      service: postgres
+    environment:
+      - POSTGRES_DB=${CW_POSTGRES_DB}
+      - POSTGRES_USER=${CW_POSTGRES_USER}
+      - POSTGRES_PASSWORD=${CW_POSTGRES_PASSWORD}
+    volumes:
+      - cw-postgres-data:/var/lib/postgresql/data
+    ports:
+      - "${CW_POSTGRES_PORT}:5432"
+    networks:
+      - chatwoot-net
+
+  cw-redis:
+    extends:
+      file: ../chatwoot/docker-compose.dev.yml
+      service: redis
+    command: ["sh", "-c", "redis-server --requirepass \"$$REDIS_PASSWORD\""]
+    environment:
+      - REDIS_PASSWORD=${CW_REDIS_PASSWORD}
+    volumes:
+      - cw-redis-data:/data
+    ports:
+      - "${CW_REDIS_PORT}:6379"
+    networks:
+      - chatwoot-net
+
+  # ─── Gateway ────────────────────────────────────────────────────────────────
+  gw-init:
+    image: gcr.io/cloud-builders/curl:latest
+    depends_on:
+      - cw-rails
+    networks:
+      - shared
+    volumes:
+      - gw-shared:/shared
+    environment:
+      - GW_CREATE_TEST_INBOX=${GW_CREATE_TEST_INBOX}
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        echo "Waiting for access token from Chatwoot..."
+        i=0
+        while [ ! -f /shared/cw_access_token ]; do
+          i=$$((i+1))
+          echo "Attempt $$i - Token file not ready yet..."
+          sleep 5
+        done
+        TOKEN=$$(cat /shared/cw_access_token)
+        echo "Got access token."
+
+        echo "Waiting for Chatwoot API to respond..."
+        until curl -so /dev/null -w '%{http_code}' http://cw-rails:3000/api/v1/profile -H "api_access_token: $$TOKEN" | grep -q '200'; do
+          sleep 3
+        done
+
+        # Create test inbox only if GW_CREATE_TEST_INBOX is set and inbox doesn't exist yet
+        if [ -n "$$GW_CREATE_TEST_INBOX" ]; then
+          PROFILE=$$(curl -s http://cw-rails:3000/api/v1/profile \
+            -H "api_access_token: $$TOKEN")
+          ACCOUNT_ID=$$(echo "$$PROFILE" | sed -n 's/.*"account_id":\([0-9]*\).*/\1/p' | head -1)
+          if [ -z "$$ACCOUNT_ID" ]; then
+            echo "ERROR: Could not determine account ID"
+            exit 1
+          fi
+          echo "Account ID: $$ACCOUNT_ID"
+
+          INBOXES=$$(curl -s http://cw-rails:3000/api/v1/accounts/$$ACCOUNT_ID/inboxes \
+            -H "api_access_token: $$TOKEN")
+          if echo "$$INBOXES" | grep -q '"Test Email Gateway"'; then
+            echo "Test inbox already exists, skipping."
+          else
+            echo "Creating test inbox..."
+            RESULT=$$(curl -s -X POST http://cw-rails:3000/api/v1/accounts/$$ACCOUNT_ID/inboxes \
+              -H "Content-Type: application/json" \
+              -H "api_access_token: $$TOKEN" \
+              -d '{"name": "Test Email Gateway", "channel": {"type": "api", "webhook_url": "http://gw-app:8000/ingest/outgoing/email/'$$ACCOUNT_ID'/webhook"}}')
+            echo "Result: $$RESULT"
+          fi
+        fi
+        echo "Done."
+
+  gw-app:
+    extends:
+      file: ../gateway/docker-compose.dev.yml
+      service: app-base
+    build:
+      context: ../gateway
+      dockerfile: build/app/Dockerfile
+    depends_on:
+      gw-db:
+        condition: service_healthy
+      gw-init:
+        condition: service_completed_successfully
+    ports:
+      - "${GW_PORT}:8000"
+    # If GW_CHATWOOT_ACCESS_TOKEN is set, use it; otherwise read auto-created token
+    command: ["sh", "-c", "if [ -z \"$$CHATWOOT_ACCESS_TOKEN\" ]; then export CHATWOOT_ACCESS_TOKEN=$$(cat /shared/cw_access_token); fi && python main.py"]
+    volumes:
+      - gw-shared:/shared:ro
+    environment:
+      - DB_USER=${GW_DB_USER:?GW_DB_USER is required}
+      - DB_PASS=${GW_DB_PASS:?GW_DB_PASS is required}
+      - DB_HOST=gw-db
+      - DB_PORT=5432
+      - DB_NAME=${GW_DB_NAME:?GW_DB_NAME is required}
+      - BOTS_CONFIG=${GW_BOTS_CONFIG}
+      - SECRET_TOKEN=${GW_SECRET_TOKEN:?GW_SECRET_TOKEN is required}
+      - MAILBOXES_CONFIG=${GW_MAILBOXES_CONFIG}
+      - CHATWOOT_ACCESS_TOKEN=${GW_CHATWOOT_ACCESS_TOKEN}
+      - CHATWOOT_BASE_URL=http://cw-rails:3000
+      - INCOMING_QUEUE_NAME=${GW_INCOMING_QUEUE_NAME}
+      - OUTGOING_QUEUE_NAME=${GW_OUTGOING_QUEUE_NAME}
+      - WH_DOMAIN=${GW_WH_DOMAIN}
+      - GROUP=${GW_GROUP}
+      - ENVIRONMENT=${GW_ENVIRONMENT}
+      - WORKERS=${GW_WORKERS}
+      - LOG_LEVEL=${GW_LOG_LEVEL}
+      - ANONYMIZE_USERS=${GW_ANONYMIZE_USERS}
+      - OTEL_ENABLED=${GW_OTEL_ENABLED}
+      - OTEL_SERVICE_NAME=${GW_OTEL_SERVICE_NAME}
+      - OTEL_ENDPOINT=${GW_OTEL_ENDPOINT}
+      - SENTRY_DSN=${GW_SENTRY_DSN}
+    networks:
+      - gateway-net
+      - shared
+
+  gw-db:
+    extends:
+      file: ../gateway/docker-compose.dev.yml
+      service: db
+    image: "ghcr.io/pgmq/pg${GW_POSTGRES_VERSION}-pgmq:${GW_PGMQ_VERSION}"
+    environment:
+      - POSTGRES_USER=${GW_DB_USER}
+      - POSTGRES_PASSWORD=${GW_DB_PASS}
+      - POSTGRES_DB=${GW_DB_NAME}
+    volumes:
+      - gw-postgres-data:/var/lib/postgresql/data
+    ports:
+      - "${GW_POSTGRES_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${GW_DB_USER} || exit 1"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    networks:
+      - gateway-net
+
+volumes:
+  cw-postgres-data:
+  cw-redis-data:
+  cw-storage:
+  gw-postgres-data:
+  gw-shared:
