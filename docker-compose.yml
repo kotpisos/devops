@@ -13,10 +13,18 @@ services:
       file: ../chatwoot/docker-compose.dev.yml
       service: base
     depends_on:
-      - cw-postgres
-      - cw-redis
+      cw-postgres:
+        condition: service_healthy
+      cw-redis:
+        condition: service_healthy
     ports:
       - "0.0.0.0:${CW_PORT}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:3000/auth/sign_in > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
     environment:
       - NODE_ENV=production
       - RAILS_ENV=production
@@ -80,8 +88,12 @@ services:
       file: ../chatwoot/docker-compose.dev.yml
       service: base
     depends_on:
-      - cw-postgres
-      - cw-redis
+      cw-rails:
+        condition: service_healthy
+      cw-postgres:
+        condition: service_started
+      cw-redis:
+        condition: service_started
     environment:
       - NODE_ENV=production
       - RAILS_ENV=production
@@ -119,6 +131,12 @@ services:
       - cw-postgres-data:/var/lib/postgresql/data
     ports:
       - "${CW_POSTGRES_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${CW_POSTGRES_USER} || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     networks:
       - chatwoot-net
 
@@ -133,6 +151,12 @@ services:
       - cw-redis-data:/data
     ports:
       - "${CW_REDIS_PORT}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     networks:
       - chatwoot-net
 
@@ -232,6 +256,12 @@ services:
       - OTEL_SERVICE_NAME=${GW_OTEL_SERVICE_NAME}
       - OTEL_ENDPOINT=${GW_OTEL_ENDPOINT}
       - SENTRY_DSN=${GW_SENTRY_DSN}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/docs\")' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
     networks:
       - gateway-net
       - shared
