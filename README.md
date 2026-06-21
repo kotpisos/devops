@@ -17,7 +17,6 @@ Run the setup script (creates required files and starts all services):
 Or manually:
 
 ```bash
-touch ../chatwoot/.env
 docker compose up -d
 ```
 
@@ -173,7 +172,6 @@ cp .env.example .env
 Или вручную:
 
 ```bash
-touch ../chatwoot/.env
 docker compose up -d
 ```
 
